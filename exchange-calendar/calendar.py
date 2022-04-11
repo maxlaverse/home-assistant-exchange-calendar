@@ -10,7 +10,6 @@ from homeassistant.components.calendar import (
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA,
     CalendarEventDevice,
-    calculate_offset,
     get_date,
     is_offset_reached,
 )
@@ -118,7 +117,6 @@ class ExchangeCalendarEventDevice(CalendarEventDevice):
         if event is None:
             self._event = event
             return
-        event = calculate_offset(event, OFFSET)
         self._offset_reached = is_offset_reached(event)
         self._event = event
 
