@@ -1,5 +1,5 @@
 """Support for Exchange Calendar."""
-import copy
+from __future__ import annotations
 from datetime import datetime, timedelta
 import logging
 import re
@@ -9,13 +9,24 @@ import voluptuous as vol
 from homeassistant.components.calendar import (
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA,
-    CalendarEventDevice,
+    CalendarEvent,
+    CalendarEntity,
     get_date,
+    extract_offset,
     is_offset_reached,
 )
-from homeassistant.const import CONF_NAME, CONF_PASSWORD, CONF_USERNAME, CONF_VERIFY_SSL
+from homeassistant.const import (
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    CONF_VERIFY_SSL,
+)
+
+from homeassistant.core import HomeAssistant
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import generate_entity_id
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle, dt
 
 _LOGGER = logging.getLogger(__name__)
@@ -50,7 +61,12 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=5)
 
 
-def setup_platform(hass, config, add_entities, disc_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities: AddEntitiesCallback,
+    disc_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the Exchange Calendar platform."""
     from exchangelib import Credentials, Account, Configuration, DELEGATE
 
@@ -72,7 +88,7 @@ def setup_platform(hass, config, add_entities, disc_info=None):
         device_id = cust_calendar[CONF_NAME]
         entity_id = generate_entity_id(ENTITY_ID_FORMAT, device_id, hass=hass)
         calendar_devices.append(
-            ExchangeCalendarEventDevice(
+            ExchangeCalendarEntity(
                 name, calendar, entity_id, True, cust_calendar[CONF_SEARCH]
             )
         )
@@ -80,47 +96,45 @@ def setup_platform(hass, config, add_entities, disc_info=None):
     add_entities(calendar_devices, True)
 
 
-class ExchangeCalendarEventDevice(CalendarEventDevice):
+class ExchangeCalendarEntity(CalendarEntity):
     """A device for getting the next Task from a Exchange Calendar."""
 
     def __init__(self, name, calendar, entity_id, all_day=False, search=None):
         """Create the Exchange Calendar Event Device."""
         self.data = ExchangeCalendarData(calendar, all_day, search)
         self.entity_id = entity_id
-        self._event = None
-        self._name = name
-        self._offset_reached = False
+        self._event: CalendarEvent | None = None
+        self._attr_name = name
 
     @property
-    def extra_state_attributes(self):
-        """Return the device state attributes."""
-        return {"offset_reached": self._offset_reached}
-
-    @property
-    def event(self):
+    def event(self) -> CalendarEvent | None:
         """Return the next upcoming event."""
         return self._event
 
     @property
     def name(self):
         """Return the name of the entity."""
-        return self._name
+        return self._attr_name
 
-    async def async_get_events(self, hass, start_date, end_date):
+    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime) -> list[CalendarEvent]:
         """Get all events in a specific time frame."""
         return await self.data.async_get_events(hass, start_date, end_date)
 
     def update(self):
         """Update event data."""
         self.data.update()
-        event = copy.deepcopy(self.data.event)
-        if event is None:
-            self._event = event
+        self._event = self.data.event
+        if self._event is None:
             return
-        self._offset_reached = is_offset_reached(event)
-        self._event = event
+        self._attr_extra_state_attributes = {
+            "offset_reached": is_offset_reached(
+                self._event.start_datetime_local, self.data.offset
+            )
+            if self._event
+            else False
+        }
 
-from exchangelib import EWSDateTime
+from exchangelib import EWSDateTime, EWSDate
 
 class ExchangeCalendarData:
     """Class to utilize the calendar dav client object to get next event."""
@@ -131,34 +145,28 @@ class ExchangeCalendarData:
         self.include_all_day = include_all_day
         self.search = search
         self.event = None
+        self.offset = None
 
-    async def async_get_events(self, hass, start_date, end_date):
+    async def async_get_events(self, hass: HomeAssistant, start_date: datetime, end_date: datetime):
         """Get all events in a specific time frame."""
         # Get event list from the current calendar
-        vevent_list = await hass.async_add_job(
-            # (start__lt=end, end__gt=start):
+        vevent_list = await hass.async_add_executor_job(
             self.calendar.filter,
-            start__range=(start_date, end_date),
+            start__lt=EWSDateTime.from_datetime(start_date),
+            end__gt=EWSDateTime.from_datetime(end_date),
+            end__lt=EWSDateTime.from_datetime(end_date + timedelta(days=15))
         )
         event_list = []
         for vevent in vevent_list:
-            uid = None
-            if hasattr(vevent, "uid"):
-                uid = vevent.uid
-
-            data = {
-                "uid": uid,
-                "title": vevent.subject,
-                "start": self.get_hass_date(vevent.start),
-                "end": self.get_hass_date(vevent.end),
-                "location": vevent.location,
-                "description": vevent.text_body,
-            }
-
-            data["start"] = get_date(data["start"]).isoformat()
-            data["end"] = get_date(data["end"]).isoformat()
-
-            event_list.append(data)
+            event_list.append(
+                CalendarEvent(
+                    summary=vevent.subject,
+                    start=get_date(vevent.start).isoformat(),
+                    end=get_date(vevent.end).isoformat(),
+                    location=vevent.location,
+                    description=vevent.text_body,
+                )
+            )
 
         return event_list
 
@@ -200,13 +208,15 @@ class ExchangeCalendarData:
             return
 
         # Populate the entity attributes with the event values
-        self.event = {
-            "summary": vevent.subject,
-            "start": self.get_hass_date(vevent.start),
-            "end": self.get_hass_date(vevent.end),
-            "location": vevent.location,
-            "description": vevent.text_body,
-        }
+        (summary, offset) = extract_offset(vevent.subject, OFFSET)
+        self.event = CalendarEvent(
+            start=vevent.start,
+            end=vevent.end,
+            summary=summary,
+            location=vevent.location,
+            description=vevent.text_body,
+        )
+        self.offset = offset
         _LOGGER.info(self.event)
 
 
@@ -232,12 +242,7 @@ class ExchangeCalendarData:
     @staticmethod
     def is_over(event):
         """Return if the event is over."""
-        return dt.now() >= event.end
+        if isinstance(event.end, EWSDateTime):
+            return dt.now() >= event.end
 
-    @staticmethod
-    def get_hass_date(obj):
-        """Return if the event matches."""
-        if isinstance(obj, datetime):
-            return {"dateTime": obj.isoformat()}
-
-        return {"date": obj.isoformat()}
+        return EWSDate.from_date(dt.now().date()) >= event.end
