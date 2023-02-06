@@ -9,7 +9,7 @@ import voluptuous as vol
 from homeassistant.components.calendar import (
     ENTITY_ID_FORMAT,
     PLATFORM_SCHEMA,
-    CalendarEventDevice,
+    CalendarEntity,
     get_date,
     is_offset_reached,
 )
@@ -80,7 +80,7 @@ def setup_platform(hass, config, add_entities, disc_info=None):
     add_entities(calendar_devices, True)
 
 
-class ExchangeCalendarEventDevice(CalendarEventDevice):
+class ExchangeCalendarEventDevice(CalendarEntity):
     """A device for getting the next Task from a Exchange Calendar."""
 
     def __init__(self, name, calendar, entity_id, all_day=False, search=None):
